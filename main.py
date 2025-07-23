@@ -637,8 +637,7 @@ def get_runpod_html_client():
     </script>
 </body>
 </html>
-"""# --- Enh
-anced ICE Candidate Parser with Runpod Logging ---
+"""
 def parse_ice_candidate_string(candidate_str: str) -> dict:
     """Parse ICE candidate string with better error handling and Runpod logging"""
     try:
