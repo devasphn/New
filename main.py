@@ -922,8 +922,7 @@ class RobustAudioTrack(MediaStreamTrack):
                 try:
                     self._audio_queue.put_nowait(audio_int16)
                 except asyncio.QueueFull:
-                    pass# --
-- Audio Processor with Enhanced Runpod Logging ---
+                    pass
 class RobustAudioProcessor:
     def __init__(self, output_track, executor):
         self.input_track = None
