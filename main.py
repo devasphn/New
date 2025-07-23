@@ -1253,8 +1253,7 @@ def initialize_models() -> bool:
         
     except Exception as e:
         model_logger.error(f"❌ Model initialization failed on Runpod: {e}", exc_info=True)
-        return False# --- 
-WebSocket Handler with Runpod Optimizations ---
+        return False
 async def websocket_handler(request):
     """Enhanced WebSocket handler optimized for Runpod"""
     ws = web.WebSocketResponse(
