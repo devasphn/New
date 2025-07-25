@@ -4,32 +4,28 @@ import json
 import logging
 import numpy as np
 import warnings
-import collections
 import time
 import librosa
 import webrtcvad
 import os
 import sys
-import base64
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 from datetime import datetime
 
 from aiohttp import web, WSMsgType
-
-from transformers import pipeline, AutoModel, AutoTokenizer
+from transformers import pipeline
 import torch.hub
 
-# Higgs Audio Integration - Direct Model Access
+# Higgs Audio Integration - Proper Import
 try:
-    # Try direct transformers approach first
-    from transformers import AutoModel, AutoTokenizer, AutoProcessor
-    HIGGS_MODEL_NAME = "bosonai/higgs-audio-v2-generation-3B-base"
-    HIGGS_TOKENIZER_NAME = "bosonai/higgs-audio-v2-tokenizer"
+    from higgs_audio.generation import HiggsAudioGeneration
+    from higgs_audio.tokenizer import HiggsAudioTokenizer
+    from higgs_audio.processor import HiggsAudioProcessor
     HIGGS_AVAILABLE = True
     print("✅ Higgs Audio imports successful")
 except ImportError as e:
-    print(f"⚠️ Higgs Audio direct import failed: {e}")
+    print(f"❌ Higgs Audio import failed: {e}")
     HIGGS_AVAILABLE = False
 
 # --- Runpod Environment Detection ---
@@ -86,11 +82,11 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # --- Global Variables ---
-uv_pipe, higgs_model, higgs_tokenizer, higgs_processor = None, None, None, None
+uv_pipe, higgs_generator, higgs_tokenizer, higgs_processor = None, None, None, None
 executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="audio_worker")
 active_connections = set()
 
-# --- WebSocket Audio Streaming HTML Client ---
+# --- HTML Client (same as before) ---
 def get_websocket_html_client():
     """Generate HTML client for WebSocket audio streaming"""
     
@@ -201,7 +197,7 @@ def get_websocket_html_client():
             <strong>🏃 Runpod WebSocket Mode with Higgs Audio v2</strong><br>
             Pod ID: {RUNPOD_POD_ID}<br>
             WebSocket: {ws_url}<br>
-            <small>✅ Advanced Neural TTS</small>
+            <small>✅ Real Higgs Audio Neural TTS</small>
         </div>
         
         <div class="controls">
@@ -231,7 +227,7 @@ def get_websocket_html_client():
         </div>
         
         <div id="conversation" class="conversation"></div>
-        <div id="debug" class="debug">WebSocket Voice Assistant with Higgs Audio v2 ready...</div>
+        <div id="debug" class="debug">WebSocket Voice Assistant with Real Higgs Audio v2 ready...</div>
         
         <audio id="responseAudio" controls style="width: 100%; margin: 10px 0; display: none;"></audio>
     </div>
@@ -481,7 +477,7 @@ def get_websocket_html_client():
         }}
 
         window.addEventListener('load', () => {{
-            log('🚀 WebSocket Voice Assistant with Higgs Audio v2 initialized');
+            log('🚀 WebSocket Voice Assistant with Real Higgs Audio v2 initialized');
             initializeWebSocket();
         }});
 
@@ -498,7 +494,7 @@ def get_websocket_html_client():
 </html>
 """
 
-# --- Enhanced VAD System ---
+# --- VAD System ---
 class ImprovedVAD:
     def __init__(self):
         self.webrtc_vad = webrtcvad.Vad(2)
@@ -695,128 +691,95 @@ class WebSocketAudioProcessor:
             return ""
     
     async def _run_higgs_tts(self, text: str) -> np.ndarray:
-        """Run Higgs Audio text-to-speech"""
+        """Run REAL Higgs Audio text-to-speech"""
         try:
             if not text.strip():
                 return np.array([])
             
-            if not HIGGS_AVAILABLE or higgs_model is None:
-                audio_logger.warning("⚠️ Higgs Audio not available, generating simple TTS substitute")
-                # Return simple beep as placeholder
-                duration = len(text) * 0.1  # Simple duration calculation
-                sample_rate = 24000
-                t = np.linspace(0, duration, int(sample_rate * duration))
-                frequency = 440  # A4 note
-                audio_output = 0.3 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
-                return audio_output
+            if not HIGGS_AVAILABLE or higgs_generator is None:
+                audio_logger.error("❌ Higgs Audio not properly loaded!")
+                return np.array([])
             
             loop = asyncio.get_running_loop()
             
             def _higgs_inference():
                 with torch.inference_mode():
                     try:
-                        # Higgs Audio v2 inference
-                        # Tokenize the text
-                        inputs = higgs_tokenizer(
-                            text,
+                        # Use the actual Higgs Audio generation pipeline
+                        model_logger.info(f"🎵 Generating audio with Higgs Audio for: '{text}'")
+                        
+                        # Process the text through Higgs processor
+                        inputs = higgs_processor(
+                            text=text,
                             return_tensors="pt",
-                            padding=True,
-                            truncation=True,
+                            sampling_rate=24000,
                             max_length=512
                         )
                         
                         # Move to GPU if available
                         if torch.cuda.is_available():
-                            inputs = {k: v.cuda() for k, v in inputs.items()}
+                            inputs = {k: v.cuda() if hasattr(v, 'cuda') else v for k, v in inputs.items()}
                         
-                        # Generate audio tokens
-                        with torch.no_grad():
-                            audio_tokens = higgs_model.generate(
-                                **inputs,
-                                max_length=1024,
-                                temperature=0.7,
-                                do_sample=True,
-                                top_p=0.9,
-                                pad_token_id=higgs_tokenizer.pad_token_id
-                            )
+                        # Generate audio using Higgs Audio
+                        audio_output = higgs_generator.generate(
+                            **inputs,
+                            max_length=2048,
+                            temperature=0.8,
+                            do_sample=True,
+                            top_p=0.9,
+                            guidance_scale=3.0
+                        )
                         
-                        # Decode audio tokens to waveform
-                        if hasattr(higgs_model, 'decode_audio'):
-                            audio_output = higgs_model.decode_audio(audio_tokens)
+                        # Extract audio waveform
+                        if hasattr(audio_output, 'audio'):
+                            waveform = audio_output.audio
+                        elif hasattr(audio_output, 'waveform'):
+                            waveform = audio_output.waveform
+                        elif isinstance(audio_output, dict) and 'audio' in audio_output:
+                            waveform = audio_output['audio']
                         else:
-                            # Fallback: convert tokens to simple audio
-                            audio_output = self._tokens_to_audio(audio_tokens)
+                            waveform = audio_output
                         
-                        if torch.is_tensor(audio_output):
-                            audio_output = audio_output.cpu().numpy()
+                        # Convert to numpy
+                        if torch.is_tensor(waveform):
+                            waveform = waveform.cpu().numpy()
                         
-                        audio_output = audio_output.flatten().astype(np.float32)
+                        # Ensure correct shape
+                        if waveform.ndim > 1:
+                            waveform = waveform.squeeze()
                         
-                        # Normalize
-                        if np.max(np.abs(audio_output)) > 0:
-                            audio_output = audio_output / max(np.max(np.abs(audio_output)), 0.1) * 0.7
+                        waveform = waveform.astype(np.float32)
                         
-                        return audio_output
+                        # Normalize audio
+                        if np.max(np.abs(waveform)) > 0:
+                            waveform = waveform / max(np.max(np.abs(waveform)), 0.1) * 0.8
+                        
+                        model_logger.info(f"✅ Higgs Audio generated {len(waveform)/24000:.2f}s of audio")
+                        return waveform
                         
                     except Exception as e:
-                        model_logger.error(f"Higgs inference error: {e}")
-                        # Fallback to simple synthesis
-                        duration = len(text) * 0.1
-                        sample_rate = 24000
-                        t = np.linspace(0, duration, int(sample_rate * duration))
-                        frequency = 440
-                        return 0.3 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
+                        model_logger.error(f"❌ Higgs Audio generation error: {e}")
+                        # Don't use fallback - fail properly
+                        return np.array([])
             
             start_time = time.time()
             audio_output = await loop.run_in_executor(executor, _higgs_inference)
             tts_time = time.time() - start_time
             
-            model_logger.info(f"🔊 Higgs TTS completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
+            if len(audio_output) > 0:
+                model_logger.info(f"🔊 Higgs TTS completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
+            else:
+                model_logger.error("❌ Higgs TTS failed to generate audio")
+            
             return audio_output
             
         except Exception as e:
             model_logger.error(f"❌ Higgs TTS error: {e}")
-            # Fallback audio
-            duration = len(text) * 0.1
-            sample_rate = 24000
-            t = np.linspace(0, duration, int(sample_rate * duration))
-            frequency = 440
-            return 0.3 * np.sin(2 * np.pi * frequency * t).astype(np.float32)
-    
-    def _tokens_to_audio(self, tokens: torch.Tensor) -> np.ndarray:
-        """Convert tokens to audio (fallback method)"""
-        try:
-            # Simple token-to-audio conversion
-            tokens_np = tokens.cpu().numpy().flatten()
-            
-            # Convert tokens to frequency values
-            frequencies = 220 + (tokens_np % 1000) * 0.5
-            
-            sample_rate = 24000
-            duration_per_token = 0.05
-            total_duration = len(frequencies) * duration_per_token
-            
-            t = np.linspace(0, total_duration, int(sample_rate * total_duration))
-            audio = np.zeros_like(t)
-            
-            for i, freq in enumerate(frequencies):
-                start_sample = int(i * duration_per_token * sample_rate)
-                end_sample = int((i + 1) * duration_per_token * sample_rate)
-                if end_sample > len(audio):
-                    end_sample = len(audio)
-                
-                t_segment = t[start_sample:end_sample] - t[start_sample]
-                audio[start_sample:end_sample] = 0.3 * np.sin(2 * np.pi * freq * t_segment)
-            
-            return audio.astype(np.float32)
-            
-        except Exception as e:
-            model_logger.error(f"Token to audio conversion error: {e}")
             return np.array([])
 
 # --- Model Initialization ---
 def initialize_models() -> bool:
-    global uv_pipe, higgs_model, higgs_tokenizer, higgs_processor
+    global uv_pipe, higgs_generator, higgs_tokenizer, higgs_processor
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_logger.info(f"🚀 Initializing models on device: {device}")
@@ -842,56 +805,67 @@ def initialize_models() -> bool:
         load_time = time.time() - start_time
         model_logger.info(f"✅ Ultravox loaded in {load_time:.1f}s")
         
-        # Load Higgs Audio
+        # Load REAL Higgs Audio
         if HIGGS_AVAILABLE:
-            model_logger.info("📥 Loading Higgs Audio v2 model...")
+            model_logger.info("📥 Loading REAL Higgs Audio v2 model...")
             start_time = time.time()
             
             try:
-                # Load Higgs Audio model and tokenizer
-                higgs_model = AutoModel.from_pretrained(
-                    HIGGS_MODEL_NAME,
-                    trust_remote_code=True,
+                # Load using the actual Higgs Audio classes
+                model_logger.info("🔄 Loading Higgs Audio Generation model...")
+                higgs_generator = HiggsAudioGeneration.from_pretrained(
+                    "boson-ai/higgs-audio-2-textaudio-24khz",
                     device_map="auto" if torch.cuda.is_available() else None,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-                )
-                
-                higgs_tokenizer = AutoTokenizer.from_pretrained(
-                    HIGGS_TOKENIZER_NAME,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                     trust_remote_code=True
                 )
                 
-                # Set pad token if not exists
-                if higgs_tokenizer.pad_token is None:
-                    higgs_tokenizer.pad_token = higgs_tokenizer.eos_token
+                model_logger.info("🔄 Loading Higgs Audio Tokenizer...")
+                higgs_tokenizer = HiggsAudioTokenizer.from_pretrained(
+                    "boson-ai/higgs-audio-2-textaudio-24khz",
+                    trust_remote_code=True
+                )
+                
+                model_logger.info("🔄 Loading Higgs Audio Processor...")
+                higgs_processor = HiggsAudioProcessor.from_pretrained(
+                    "boson-ai/higgs-audio-2-textaudio-24khz",
+                    trust_remote_code=True
+                )
                 
                 load_time = time.time() - start_time
-                model_logger.info(f"✅ Higgs Audio v2 loaded in {load_time:.1f}s")
+                model_logger.info(f"✅ REAL Higgs Audio v2 loaded in {load_time:.1f}s")
                 
             except Exception as e:
-                model_logger.error(f"❌ Higgs Audio loading failed: {e}")
-                model_logger.info("🔄 Attempting alternative loading method...")
+                model_logger.error(f"❌ REAL Higgs Audio loading failed: {e}")
+                model_logger.info("🔄 Trying alternative Higgs model...")
                 
                 try:
-                    # Alternative: Load as text generation model
-                    higgs_model = AutoModel.from_pretrained(
-                        "microsoft/DialoGPT-medium",  # Fallback model
+                    # Try the demo model that might be more accessible
+                    higgs_generator = HiggsAudioGeneration.from_pretrained(
+                        "boson-ai/higgs-audio-v2-generation-3B-base",
                         device_map="auto" if torch.cuda.is_available() else None,
-                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                        trust_remote_code=True
                     )
                     
-                    higgs_tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-                    if higgs_tokenizer.pad_token is None:
-                        higgs_tokenizer.pad_token = higgs_tokenizer.eos_token
+                    higgs_tokenizer = HiggsAudioTokenizer.from_pretrained(
+                        "boson-ai/higgs-audio-v2-tokenizer",
+                        trust_remote_code=True
+                    )
                     
-                    model_logger.warning("⚠️ Using fallback model instead of Higgs Audio")
+                    higgs_processor = HiggsAudioProcessor.from_pretrained(
+                        "boson-ai/higgs-audio-v2-generation-3B-base",
+                        trust_remote_code=True
+                    )
+                    
+                    model_logger.info("✅ Alternative Higgs Audio model loaded")
                     
                 except Exception as e2:
-                    model_logger.error(f"❌ Fallback model loading also failed: {e2}")
-                    higgs_model = None
-                    higgs_tokenizer = None
+                    model_logger.error(f"❌ All Higgs Audio loading attempts failed: {e2}")
+                    return False  # Fail completely if Higgs Audio doesn't work
         else:
-            model_logger.warning("⚠️ Higgs Audio not available")
+            model_logger.error("❌ Higgs Audio not available - cannot proceed")
+            return False
         
         # Warmup
         model_logger.info("🔥 Warming up models...")
@@ -906,22 +880,28 @@ def initialize_models() -> bool:
             except Exception as e:
                 model_logger.warning(f"⚠️ Ultravox warmup issue: {e}")
             
-            if HIGGS_AVAILABLE and higgs_model is not None and higgs_tokenizer is not None:
+            if higgs_generator is not None and higgs_processor is not None:
                 try:
                     start_time = time.time()
-                    test_input = higgs_tokenizer("Test", return_tensors="pt", padding=True)
+                    test_inputs = higgs_processor(
+                        text="Test",
+                        return_tensors="pt",
+                        sampling_rate=24000
+                    )
                     if torch.cuda.is_available():
-                        test_input = {k: v.cuda() for k, v in test_input.items()}
-                    _ = higgs_model(**test_input)
+                        test_inputs = {k: v.cuda() if hasattr(v, 'cuda') else v for k, v in test_inputs.items()}
+                    
+                    _ = higgs_generator.generate(**test_inputs, max_length=10)
                     warmup_time = time.time() - start_time
-                    model_logger.info(f"✅ Higgs Audio warmed up in {warmup_time*1000:.0f}ms")
+                    model_logger.info(f"✅ REAL Higgs Audio warmed up in {warmup_time*1000:.0f}ms")
                 except Exception as e:
-                    model_logger.warning(f"⚠️ Higgs Audio warmup issue: {e}")
+                    model_logger.error(f"❌ Higgs Audio warmup failed: {e}")
+                    return False
         
         # Final status
-        higgs_status = HIGGS_AVAILABLE and higgs_model is not None and higgs_tokenizer is not None
-        model_logger.info(f"🎉 Models ready! Higgs Audio: {'✅' if higgs_status else '❌'}")
-        return True
+        higgs_status = higgs_generator is not None and higgs_processor is not None
+        model_logger.info(f"🎉 Models ready! REAL Higgs Audio: {'✅' if higgs_status else '❌'}")
+        return higgs_status  # Only return True if Higgs Audio actually works
         
     except Exception as e:
         model_logger.error(f"❌ Model initialization failed: {e}", exc_info=True)
@@ -976,11 +956,11 @@ async def websocket_handler(request):
                             # Send audio data
                             await ws.send_bytes(wav_data)
                             
-                            logger.info(f"✅ Sent {len(wav_data)} bytes of audio to {client_ip}")
+                            logger.info(f"✅ Sent {len(wav_data)} bytes of REAL Higgs Audio to {client_ip}")
                         else:
                             await ws.send_json({
                                 'type': 'error',
-                                'message': 'No audio generated'
+                                'message': 'Higgs Audio failed to generate audio'
                             })
                     else:
                         await ws.send_json({
@@ -1067,11 +1047,13 @@ async def health_handler(request):
     else:
         gpu_info = {"available": False}
     
-    higgs_status = HIGGS_AVAILABLE and higgs_model is not None and higgs_tokenizer is not None
+    higgs_status = (HIGGS_AVAILABLE and 
+                   higgs_generator is not None and 
+                   higgs_processor is not None)
     
     return web.json_response({
-        "status": "healthy",
-        "mode": "websocket_audio_streaming_with_higgs_v2",
+        "status": "healthy" if higgs_status else "degraded",
+        "mode": "websocket_audio_streaming_with_REAL_higgs_v2",
         "runpod": {
             "pod_id": RUNPOD_POD_ID,
             "public_ip": RUNPOD_PUBLIC_IP,
@@ -1079,10 +1061,10 @@ async def health_handler(request):
         },
         "models": {
             "ultravox": uv_pipe is not None,
-            "higgs_audio": higgs_status,
+            "higgs_audio_real": higgs_status,
             "higgs_available": HIGGS_AVAILABLE,
-            "higgs_model_loaded": higgs_model is not None,
-            "higgs_tokenizer_loaded": higgs_tokenizer is not None
+            "higgs_generator_loaded": higgs_generator is not None,
+            "higgs_processor_loaded": higgs_processor is not None
         },
         "connections": len(active_connections),
         "gpu": gpu_info,
@@ -1104,7 +1086,9 @@ async def on_shutdown(app):
 
 async def main():
     if not initialize_models():
-        logger.error("❌ Model initialization failed")
+        logger.error("❌ Model initialization failed - REAL Higgs Audio required!")
+        print("\n❌ STARTUP FAILED: REAL Higgs Audio could not be loaded!")
+        print("💡 Check that higgs-audio was properly installed and models are accessible")
         return
     
     app = web.Application()
@@ -1125,17 +1109,17 @@ async def main():
     else:
         public_url = f"http://0.0.0.0:{port}"
     
-    higgs_status = HIGGS_AVAILABLE and higgs_model is not None and higgs_tokenizer is not None
+    higgs_status = (higgs_generator is not None and higgs_processor is not None)
     
     print("\n" + "="*80)
-    print("🚀 WEBSOCKET VOICE ASSISTANT - HIGGS AUDIO V2")
+    print("🚀 WEBSOCKET VOICE ASSISTANT - REAL HIGGS AUDIO V2")
     print("="*80)
     print(f"🏃 Runpod Pod ID: {RUNPOD_POD_ID}")
     print(f"📡 Public URL: {public_url}")
     print(f"🔗 Health Check: {public_url}/health")
-    print(f"🎯 Mode: WebSocket Audio Streaming with Higgs Audio v2")
+    print(f"🎯 Mode: WebSocket Audio Streaming with REAL Higgs Audio v2")
     print(f"🧠 GPU: {'✅ ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else '❌ CPU Only'}")
-    print(f"🔊 TTS: {'✅ Higgs Audio v2' if higgs_status else '❌ Higgs Audio fallback mode'}")
+    print(f"🔊 TTS: {'✅ REAL Higgs Audio v2' if higgs_status else '❌ Higgs Audio FAILED'}")
     print(f"🎤 STT: ✅ Ultravox")
     print(f"📝 Logging: ✅ Enhanced")
     print(f"🌐 WebSocket: ✅ Binary Audio Streaming")
@@ -1143,7 +1127,7 @@ async def main():
     print("🛑 Press Ctrl+C to stop")
     print("="*80 + "\n")
     
-    logger.info(f"🎉 WebSocket voice assistant with Higgs Audio v2 started")
+    logger.info(f"🎉 WebSocket voice assistant with REAL Higgs Audio v2 started")
     logger.info(f"📡 Accessible at: {public_url}")
     
     try:
