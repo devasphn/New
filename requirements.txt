@@ -1,4 +1,4 @@
-transformers 
+transformers>=4.45.0
 accelerate
 mistral-common[audio]>=1.8.1
 librosa
@@ -10,3 +10,5 @@ aiohttp
 aiofiles
 webrtcvad
 uvloop
+einops
+datasets
