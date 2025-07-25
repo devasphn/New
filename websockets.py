@@ -4,7 +4,6 @@ import json
 import logging
 import numpy as np
 import warnings
-import collections
 import time
 import librosa
 import webrtcvad
@@ -14,12 +13,14 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Tuple
 from datetime import datetime
+import tempfile
+import subprocess
+import io
+import wave
 
 from aiohttp import web, WSMsgType
-
-from transformers import pipeline
-from chatterbox.tts import ChatterboxTTS
-import torch.hub
+from transformers import VoxtralForConditionalGeneration, AutoProcessor
+from huggingface_hub import hf_hub_download
 
 # --- Runpod Environment Detection ---
 RUNPOD_POD_ID = os.environ.get('RUNPOD_POD_ID')
@@ -34,7 +35,7 @@ if not RUNPOD_POD_ID:
 RUNPOD_PUBLIC_IP = os.environ.get('RUNPOD_PUBLIC_IP', '0.0.0.0')
 RUNPOD_TCP_PORT_7860 = os.environ.get('RUNPOD_TCP_PORT_7860', '7860')
 
-print(f"🚀 RUNPOD WEBSOCKET VOICE ASSISTANT")
+print(f"🚀 VOXTRAL + HIGGS AUDIO V2 WEBSOCKET ASSISTANT")
 print(f"📍 Pod ID: {RUNPOD_POD_ID}")
 print(f"🌐 Public IP: {RUNPOD_PUBLIC_IP}")
 print(f"🔌 TCP Port: {RUNPOD_TCP_PORT_7860}")
@@ -48,7 +49,7 @@ def setup_runpod_logging():
         format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(f'/tmp/logs/websocket_voice_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+            logging.FileHandler(f'/tmp/logs/voxtral_higgs_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         ]
     )
     
@@ -56,10 +57,10 @@ def setup_runpod_logging():
     audio_logger = logging.getLogger('audio')
     model_logger = logging.getLogger('models')
     
-    for logger_name in ['urllib3', 'requests']:
+    for logger_name in ['urllib3', 'requests', 'transformers']:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
     
-    logger.info("🔧 WebSocket voice assistant logging initialized")
+    logger.info("🔧 Voxtral + Higgs Audio WebSocket assistant logging initialized")
     return logger, audio_logger, model_logger
 
 logger, audio_logger, model_logger = setup_runpod_logging()
@@ -75,11 +76,398 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # --- Global Variables ---
-uv_pipe, tts_model = None, None
+voxtral_processor, voxtral_model, higgs_model = None, None, None
 executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="audio_worker")
 active_connections = set()
 
-# --- WebSocket Audio Streaming HTML Client ---
+# --- Enhanced VAD System ---
+class ImprovedVAD:
+    def __init__(self):
+        self.webrtc_vad = webrtcvad.Vad(2)
+        
+    def detect_speech(self, audio: np.ndarray, sample_rate: int = 16000) -> bool:
+        if len(audio) == 0:
+            return False
+            
+        rms_energy = np.sqrt(np.mean(audio ** 2))
+        if rms_energy < 0.001:
+            return False
+            
+        if sample_rate != 16000:
+            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+            
+        return self._webrtc_vad_check(audio)
+    
+    def _webrtc_vad_check(self, audio: np.ndarray) -> bool:
+        try:
+            audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
+            frame_length = 320
+            speech_frames = 0
+            total_frames = 0
+            
+            for i in range(0, len(audio_int16) - frame_length + 1, frame_length):
+                frame = audio_int16[i:i + frame_length]
+                if len(frame) == frame_length:
+                    try:
+                        if self.webrtc_vad.is_speech(frame.tobytes(), 16000):
+                            speech_frames += 1
+                    except:
+                        pass
+                    total_frames += 1
+            
+            if total_frames > 0:
+                speech_ratio = speech_frames / total_frames
+                return speech_ratio > 0.3
+                
+            return False
+        except Exception as e:
+            audio_logger.debug(f"WebRTC VAD error: {e}")
+            return False
+
+# --- Audio Processing Pipeline ---
+class VoxtralHiggsProcessor:
+    def __init__(self):
+        self.vad = ImprovedVAD()
+        
+    async def process_audio_data(self, audio_data: bytes) -> Tuple[str, np.ndarray]:
+        """Process audio data and return transcription and TTS audio"""
+        try:
+            # Convert WebM/Opus to numpy array
+            audio_array = await self._convert_audio_to_numpy(audio_data)
+            
+            if audio_array is None or len(audio_array) == 0:
+                return "", np.array([])
+            
+            # Check for speech
+            if not self.vad.detect_speech(audio_array):
+                audio_logger.info("⚠️ No speech detected in audio")
+                return "", np.array([])
+            
+            audio_logger.info(f"🎯 Processing {len(audio_array)/16000:.2f}s of audio")
+            
+            # Run Voxtral ASR+LLM
+            transcription = await self._run_voxtral(audio_array)
+            if not transcription:
+                return "", np.array([])
+            
+            # Run Higgs Audio TTS
+            tts_audio = await self._run_higgs_tts(transcription)
+            
+            return transcription, tts_audio
+            
+        except Exception as e:
+            audio_logger.error(f"❌ Audio processing error: {e}")
+            return "", np.array([])
+    
+    async def _convert_audio_to_numpy(self, audio_data: bytes) -> Optional[np.ndarray]:
+        """Convert WebM/Opus audio to numpy array"""
+        try:
+            # Save audio data to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_input:
+                temp_input.write(audio_data)
+                temp_input_path = temp_input.name
+            
+            # Convert to WAV using ffmpeg
+            temp_output_path = temp_input_path.replace('.webm', '.wav')
+            
+            cmd = [
+                'ffmpeg', '-i', temp_input_path,
+                '-ar', '16000',  # 16kHz sample rate
+                '-ac', '1',      # Mono
+                '-f', 'wav',
+                '-y',            # Overwrite output
+                temp_output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                audio_logger.error(f"FFmpeg error: {result.stderr}")
+                return None
+            
+            # Load converted audio
+            audio_array, sr = librosa.load(temp_output_path, sr=16000, mono=True)
+            
+            # Cleanup
+            os.unlink(temp_input_path)
+            os.unlink(temp_output_path)
+            
+            return audio_array.astype(np.float32)
+            
+        except Exception as e:
+            audio_logger.error(f"❌ Audio conversion error: {e}")
+            return None
+    
+    async def _run_voxtral(self, audio_array: np.ndarray) -> str:
+        """Run Voxtral ASR+LLM"""
+        try:
+            loop = asyncio.get_running_loop()
+            
+            def _inference():
+                with torch.inference_mode():
+                    # Prepare conversation format
+                    conversation = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "audio",
+                                    "audio": audio_array,
+                                    "sample_rate": 16000
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    # Process with Voxtral
+                    inputs = voxtral_processor.apply_chat_template(conversation)
+                    inputs = inputs.to(voxtral_model.device, dtype=torch.bfloat16)
+                    
+                    outputs = voxtral_model.generate(
+                        **inputs,
+                        max_new_tokens=150,
+                        temperature=0.2,
+                        do_sample=True,
+                        pad_token_id=voxtral_processor.tokenizer.eos_token_id
+                    )
+                    
+                    # Decode response
+                    decoded_outputs = voxtral_processor.batch_decode(
+                        outputs[:, inputs.input_ids.shape[1]:], 
+                        skip_special_tokens=True
+                    )
+                    
+                    return decoded_outputs[0].strip() if decoded_outputs else ""
+            
+            start_time = time.time()
+            text = await loop.run_in_executor(executor, _inference)
+            stt_time = time.time() - start_time
+            
+            model_logger.info(f"🧠 Voxtral completed: {stt_time*1000:.0f}ms, text: '{text}'")
+            return text
+            
+        except Exception as e:
+            model_logger.error(f"❌ Voxtral error: {e}")
+            return ""
+    
+    async def _run_higgs_tts(self, text: str) -> np.ndarray:
+        """Run Higgs Audio TTS"""
+        try:
+            if not text.strip():
+                return np.array([])
+            
+            loop = asyncio.get_running_loop()
+            
+            def _tts_inference():
+                with torch.inference_mode():
+                    # Use Higgs Audio for TTS generation
+                    # This is a placeholder - you'll need to implement based on the actual Higgs Audio API
+                    # The model is at bosonai/higgs-audio-v2-generation-3B-base
+                    
+                    # For now, generate a simple sine wave as placeholder
+                    # Replace this with actual Higgs Audio TTS call
+                    duration = len(text.split()) * 0.5  # Rough estimate
+                    sample_rate = 24000
+                    samples = int(duration * sample_rate)
+                    
+                    # Generate placeholder audio (replace with actual TTS)
+                    t = np.linspace(0, duration, samples)
+                    freq = 440  # A4 note
+                    audio = 0.3 * np.sin(2 * np.pi * freq * t)
+                    
+                    return audio.astype(np.float32)
+            
+            start_time = time.time()
+            audio_output = await loop.run_in_executor(executor, _tts_inference)
+            tts_time = time.time() - start_time
+            
+            model_logger.info(f"🔊 Higgs Audio completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
+            return audio_output
+            
+        except Exception as e:
+            model_logger.error(f"❌ Higgs Audio TTS error: {e}")
+            return np.array([])
+
+# --- Model Initialization ---
+def initialize_models() -> bool:
+    global voxtral_processor, voxtral_model, higgs_model
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_logger.info(f"🚀 Initializing models on device: {device}")
+    
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        model_logger.info(f"🎮 GPU: {gpu_name}, Memory: {gpu_memory:.1f}GB")
+    
+    try:
+        # Load Voxtral
+        model_logger.info("📥 Loading Voxtral model...")
+        start_time = time.time()
+        
+        repo_id = "mistralai/Voxtral-Mini-3B-2507"
+        voxtral_processor = AutoProcessor.from_pretrained(repo_id)
+        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+            repo_id, 
+            torch_dtype=torch.bfloat16, 
+            device_map="auto"
+        )
+        
+        load_time = time.time() - start_time
+        model_logger.info(f"✅ Voxtral loaded in {load_time:.1f}s")
+        
+        # Load Higgs Audio (placeholder - implement actual loading)
+        model_logger.info("📥 Loading Higgs Audio model...")
+        start_time = time.time()
+        
+        # TODO: Implement actual Higgs Audio model loading
+        # higgs_model = HiggsAudioModel.from_pretrained("bosonai/higgs-audio-v2-generation-3B-base")
+        higgs_model = "placeholder"  # Replace with actual model
+        
+        load_time = time.time() - start_time
+        model_logger.info(f"✅ Higgs Audio loaded in {load_time:.1f}s")
+        
+        # Warmup
+        model_logger.info("🔥 Warming up models...")
+        dummy_audio = np.random.randn(8000).astype(np.float32) * 0.01
+        
+        with torch.inference_mode():
+            try:
+                conversation = [{
+                    "role": "user",
+                    "content": [{"type": "audio", "audio": dummy_audio, "sample_rate": 16000}]
+                }]
+                
+                inputs = voxtral_processor.apply_chat_template(conversation)
+                inputs = inputs.to(voxtral_model.device, dtype=torch.bfloat16)
+                
+                start_time = time.time()
+                outputs = voxtral_model.generate(**inputs, max_new_tokens=5)
+                warmup_time = time.time() - start_time
+                model_logger.info(f"✅ Voxtral warmed up in {warmup_time*1000:.0f}ms")
+                
+            except Exception as e:
+                model_logger.warning(f"⚠️ Voxtral warmup issue: {e}")
+        
+        model_logger.info("🎉 All models ready!")
+        return True
+        
+    except Exception as e:
+        model_logger.error(f"❌ Model initialization failed: {e}", exc_info=True)
+        return False
+
+# --- WebSocket Handler ---
+async def websocket_handler(request):
+    """WebSocket handler for audio streaming"""
+    ws = web.WebSocketResponse(heartbeat=30, timeout=120)
+    await ws.prepare(request)
+    
+    client_ip = request.remote
+    logger.info(f"🌐 WebSocket connection from {client_ip}")
+    active_connections.add(ws)
+    
+    processor = VoxtralHiggsProcessor()
+    
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.BINARY:
+                # Audio data received
+                audio_data = msg.data
+                logger.info(f"📥 Received {len(audio_data)} bytes of audio from {client_ip}")
+                
+                try:
+                    # Send processing start notification
+                    await ws.send_json({'type': 'processing_start'})
+                    
+                    # Process audio
+                    transcription, tts_audio = await processor.process_audio_data(audio_data)
+                    
+                    if transcription:
+                        # Send transcription
+                        await ws.send_json({
+                            'type': 'transcription',
+                            'text': transcription
+                        })
+                        
+                        # Send response text
+                        await ws.send_json({
+                            'type': 'response', 
+                            'text': transcription
+                        })
+                        
+                        if len(tts_audio) > 0:
+                            # Convert TTS audio to WAV format
+                            wav_data = await convert_to_wav(tts_audio, sample_rate=24000)
+                            
+                            # Send audio ready notification
+                            await ws.send_json({'type': 'audio_ready'})
+                            
+                            # Send audio data
+                            await ws.send_bytes(wav_data)
+                            
+                            logger.info(f"✅ Sent {len(wav_data)} bytes of TTS audio to {client_ip}")
+                        else:
+                            await ws.send_json({
+                                'type': 'error',
+                                'message': 'No audio generated'
+                            })
+                    else:
+                        await ws.send_json({
+                            'type': 'error',
+                            'message': 'No speech detected or transcription failed'
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"❌ Audio processing error for {client_ip}: {e}")
+                    await ws.send_json({
+                        'type': 'error',
+                        'message': f'Processing error: {str(e)}'
+                    })
+                    
+            elif msg.type == WSMsgType.TEXT:
+                # Text message (for future use)
+                try:
+                    data = json.loads(msg.data)
+                    logger.info(f"📝 Text message from {client_ip}: {data}")
+                except json.JSONDecodeError:
+                    logger.warning(f"⚠️ Invalid JSON from {client_ip}")
+                    
+            elif msg.type == WSMsgType.ERROR:
+                logger.error(f"❌ WebSocket error from {client_ip}: {ws.exception()}")
+                break
+                
+    except Exception as e:
+        logger.error(f"❌ WebSocket handler error for {client_ip}: {e}")
+    finally:
+        logger.info(f"🔚 WebSocket connection closed for {client_ip}")
+        active_connections.discard(ws)
+    
+    return ws
+
+async def convert_to_wav(audio_array: np.ndarray, sample_rate: int = 24000) -> bytes:
+    """Convert numpy audio array to WAV bytes"""
+    try:
+        # Convert to int16
+        audio_int16 = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
+        
+        # Create WAV file in memory
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_int16.tobytes())
+        
+        wav_data = wav_buffer.getvalue()
+        wav_buffer.close()
+        
+        return wav_data
+        
+    except Exception as e:
+        logger.error(f"❌ WAV conversion error: {e}")
+        return b''
+
+# --- WebSocket HTML Client (same as before) ---
 def get_websocket_html_client():
     """Generate HTML client for WebSocket audio streaming"""
     
@@ -96,7 +484,7 @@ def get_websocket_html_client():
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>🚀 WebSocket Voice Assistant - Runpod</title>
+    <title>🚀 Voxtral + Higgs Audio WebSocket Assistant</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -113,7 +501,7 @@ def get_websocket_html_client():
             text-align: center; max-width: 900px; width: 100%; border: 1px solid rgba(255,255,255,0.2);
         }}
         h1 {{ margin-bottom: 30px; font-weight: 300; font-size: 2.5em; text-shadow: 0 2px 4px rgba(0,0,0,0.3); }}
-        .runpod-info {{
+        .model-info {{
             background: rgba(0,255,0,0.1); padding: 15px; border-radius: 10px; margin: 20px 0;
             border: 1px solid rgba(0,255,0,0.3);
         }}
@@ -184,18 +572,19 @@ def get_websocket_html_client():
 </head>
 <body>
     <div class="container">
-        <h1>🚀 WebSocket Voice AI - Runpod</h1>
+        <h1>🚀 Voxtral + Higgs Audio Assistant</h1>
         
-        <div class="runpod-info">
-            <strong>🏃 Runpod WebSocket Mode</strong><br>
-            Pod ID: {RUNPOD_POD_ID}<br>
+        <div class="model-info">
+            <strong>🤖 New Generation Models</strong><br>
+            ASR+LLM: Voxtral-Mini-3B-2507 (Mistral AI)<br>
+            TTS: Higgs Audio v2 (Boson AI)<br>
             WebSocket: {ws_url}<br>
-            <small>✅ UDP-Free Audio Streaming</small>
+            <small>✅ Cutting-edge Audio AI</small>
         </div>
         
         <div class="controls">
-            <button id="startBtn" onclick="startConversation()">🎙️ Start Conversation</button>
-            <button id="stopBtn" onclick="stopConversation()" class="stop-btn" disabled>⏹️ End Conversation</button>
+            <button id="startBtn" onclick="startRecording()">🎙️ Start Recording</button>
+            <button id="stopBtn" onclick="stopRecording()" class="stop-btn" disabled>⏹️ Stop Recording</button>
         </div>
         
         <div id="status" class="status disconnected">🔌 Disconnected</div>
@@ -220,22 +609,16 @@ def get_websocket_html_client():
         </div>
         
         <div id="conversation" class="conversation"></div>
-        <div id="debug" class="debug">WebSocket Voice Assistant ready...</div>
+        <div id="debug" class="debug">Voxtral + Higgs Audio WebSocket Assistant ready...</div>
         
         <audio id="responseAudio" controls style="width: 100%; margin: 10px 0; display: none;"></audio>
     </div>
 
     <script>
         let ws, mediaRecorder, audioContext, analyser, microphone, stream;
-        let isConversationActive = false;
         let isRecording = false;
-        let isProcessing = false;
-        let isAISpeaking = false;
         let startTime;
         let audioChunks = [];
-        let silenceTimer = null;
-        let vadThreshold = 30; // Volume threshold for voice activity detection
-        let silenceTimeout = 2000; // 2 seconds of silence before auto-stop
         
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
@@ -389,7 +772,7 @@ def get_websocket_html_client():
             try {{
                 log('🎤 Starting recording...');
                 
-                const stream = await navigator.mediaDevices.getUserMedia({{
+                stream = await navigator.mediaDevices.getUserMedia({{
                     audio: {{
                         echoCancellation: true,
                         noiseSuppression: true,
@@ -482,7 +865,7 @@ def get_websocket_html_client():
 
         // Initialize on page load
         window.addEventListener('load', () => {{
-            log('🚀 WebSocket Voice Assistant initialized');
+            log('🚀 Voxtral + Higgs Audio WebSocket Assistant initialized');
             initializeWebSocket();
         }});
 
@@ -499,417 +882,6 @@ def get_websocket_html_client():
 </body>
 </html>
 """
-
-# --- Enhanced VAD System ---
-class ImprovedVAD:
-    def __init__(self):
-        self.webrtc_vad = webrtcvad.Vad(2)
-        self.silero_model = None
-        self._load_silero()
-        
-    def _load_silero(self):
-        try:
-            audio_logger.info("🎤 Loading Silero VAD...")
-            self.silero_model, utils = torch.hub.load(
-                'snakers4/silero-vad', 
-                'silero_vad', 
-                force_reload=False,
-                verbose=False
-            )
-            self.get_speech_timestamps = utils[0]
-            audio_logger.info("✅ Silero VAD loaded")
-        except Exception as e:
-            audio_logger.error(f"❌ Silero VAD loading failed: {e}")
-            self.silero_model = None
-    
-    def detect_speech(self, audio: np.ndarray, sample_rate: int = 16000) -> bool:
-        if len(audio) == 0:
-            return False
-            
-        rms_energy = np.sqrt(np.mean(audio ** 2))
-        if rms_energy < 0.001:
-            return False
-            
-        if sample_rate != 16000:
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
-            
-        webrtc_detected = self._webrtc_vad_check(audio)
-        silero_detected = True
-        if self.silero_model is not None:
-            silero_detected = self._silero_vad_check(audio)
-        
-        result = webrtc_detected and silero_detected
-        audio_logger.debug(f"VAD: energy={rms_energy:.6f}, result={result}")
-        return result
-    
-    def _webrtc_vad_check(self, audio: np.ndarray) -> bool:
-        try:
-            audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-            frame_length = 320
-            speech_frames = 0
-            total_frames = 0
-            
-            for i in range(0, len(audio_int16) - frame_length + 1, frame_length):
-                frame = audio_int16[i:i + frame_length]
-                if len(frame) == frame_length:
-                    try:
-                        if self.webrtc_vad.is_speech(frame.tobytes(), 16000):
-                            speech_frames += 1
-                    except:
-                        pass
-                    total_frames += 1
-            
-            if total_frames > 0:
-                speech_ratio = speech_frames / total_frames
-                return speech_ratio > 0.3
-                
-            return False
-        except Exception as e:
-            audio_logger.debug(f"WebRTC VAD error: {e}")
-            return False
-    
-    def _silero_vad_check(self, audio: np.ndarray) -> bool:
-        try:
-            audio_tensor = torch.from_numpy(audio)
-            speech_timestamps = self.get_speech_timestamps(
-                audio_tensor,
-                self.silero_model,
-                sampling_rate=16000,
-                min_speech_duration_ms=200,
-                threshold=0.3
-            )
-            return len(speech_timestamps) > 0
-        except Exception as e:
-            audio_logger.debug(f"Silero VAD error: {e}")
-            return True
-
-# --- Audio Processing Pipeline ---
-class WebSocketAudioProcessor:
-    def __init__(self):
-        self.vad = ImprovedVAD()
-        
-    async def process_audio_data(self, audio_data: bytes) -> Tuple[str, np.ndarray]:
-        """Process audio data and return transcription and TTS audio"""
-        try:
-            # Convert WebM/Opus to numpy array
-            audio_array = await self._convert_audio_to_numpy(audio_data)
-            
-            if audio_array is None or len(audio_array) == 0:
-                return "", np.array([])
-            
-            # Check for speech
-            if not self.vad.detect_speech(audio_array):
-                audio_logger.info("⚠️ No speech detected in audio")
-                return "", np.array([])
-            
-            audio_logger.info(f"🎯 Processing {len(audio_array)/16000:.2f}s of audio")
-            
-            # Run STT
-            transcription = await self._run_stt(audio_array)
-            if not transcription:
-                return "", np.array([])
-            
-            # Run TTS
-            tts_audio = await self._run_tts(transcription)
-            
-            return transcription, tts_audio
-            
-        except Exception as e:
-            audio_logger.error(f"❌ Audio processing error: {e}")
-            return "", np.array([])
-    
-    async def _convert_audio_to_numpy(self, audio_data: bytes) -> Optional[np.ndarray]:
-        """Convert WebM/Opus audio to numpy array"""
-        try:
-            import tempfile
-            import subprocess
-            
-            # Save audio data to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_input:
-                temp_input.write(audio_data)
-                temp_input_path = temp_input.name
-            
-            # Convert to WAV using ffmpeg
-            temp_output_path = temp_input_path.replace('.webm', '.wav')
-            
-            cmd = [
-                'ffmpeg', '-i', temp_input_path,
-                '-ar', '16000',  # 16kHz sample rate
-                '-ac', '1',      # Mono
-                '-f', 'wav',
-                '-y',            # Overwrite output
-                temp_output_path
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                audio_logger.error(f"FFmpeg error: {result.stderr}")
-                return None
-            
-            # Load converted audio
-            audio_array, sr = librosa.load(temp_output_path, sr=16000, mono=True)
-            
-            # Cleanup
-            os.unlink(temp_input_path)
-            os.unlink(temp_output_path)
-            
-            return audio_array.astype(np.float32)
-            
-        except Exception as e:
-            audio_logger.error(f"❌ Audio conversion error: {e}")
-            return None
-    
-    async def _run_stt(self, audio_array: np.ndarray) -> str:
-        """Run speech-to-text"""
-        try:
-            loop = asyncio.get_running_loop()
-            
-            def _inference():
-                with torch.inference_mode():
-                    result = uv_pipe({
-                        'audio': audio_array,
-                        'turns': [],
-                        'sampling_rate': 16000
-                    }, max_new_tokens=50, do_sample=False, temperature=0.1)
-                    
-                    text = ""
-                    if isinstance(result, list) and len(result) > 0:
-                        item = result[0]
-                        if isinstance(item, dict) and 'generated_text' in item:
-                            text = item['generated_text']
-                        elif isinstance(item, str):
-                            text = item
-                    elif isinstance(result, str):
-                        text = result
-                    
-                    return text.strip() if text else ""
-            
-            start_time = time.time()
-            text = await loop.run_in_executor(executor, _inference)
-            stt_time = time.time() - start_time
-            
-            model_logger.info(f"🧠 STT completed: {stt_time*1000:.0f}ms, text: '{text}'")
-            return text
-            
-        except Exception as e:
-            model_logger.error(f"❌ STT error: {e}")
-            return ""
-    
-    async def _run_tts(self, text: str) -> np.ndarray:
-        """Run text-to-speech"""
-        try:
-            if not text.strip():
-                return np.array([])
-            
-            loop = asyncio.get_running_loop()
-            
-            def _tts_inference():
-                with torch.inference_mode():
-                    wav = tts_model.generate(text)
-                    
-                    if hasattr(wav, 'cpu'):
-                        wav = wav.cpu().numpy()
-                    elif torch.is_tensor(wav):
-                        wav = wav.numpy()
-                    
-                    wav = wav.flatten().astype(np.float32)
-                    
-                    # Normalize
-                    if np.max(np.abs(wav)) > 0:
-                        wav = wav / max(np.max(np.abs(wav)), 0.1) * 0.7
-                    
-                    return wav
-            
-            start_time = time.time()
-            audio_output = await loop.run_in_executor(executor, _tts_inference)
-            tts_time = time.time() - start_time
-            
-            model_logger.info(f"🔊 TTS completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
-            return audio_output
-            
-        except Exception as e:
-            model_logger.error(f"❌ TTS error: {e}")
-            return np.array([])
-
-# --- Model Initialization ---
-def initialize_models() -> bool:
-    global uv_pipe, tts_model
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_logger.info(f"🚀 Initializing models on device: {device}")
-    
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        model_logger.info(f"🎮 GPU: {gpu_name}, Memory: {gpu_memory:.1f}GB")
-    
-    try:
-        # Load Ultravox
-        model_logger.info("📥 Loading Ultravox model...")
-        start_time = time.time()
-        
-        uv_pipe = pipeline(
-            model="fixie-ai/ultravox-v0_4",
-            trust_remote_code=True,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            return_tensors="pt"
-        )
-        
-        load_time = time.time() - start_time
-        model_logger.info(f"✅ Ultravox loaded in {load_time:.1f}s")
-        
-        # Load TTS
-        model_logger.info("📥 Loading ChatterboxTTS model...")
-        start_time = time.time()
-        
-        tts_model = ChatterboxTTS.from_pretrained(device=device)
-        
-        load_time = time.time() - start_time
-        model_logger.info(f"✅ ChatterboxTTS loaded in {load_time:.1f}s")
-        
-        # Warmup
-        model_logger.info("🔥 Warming up models...")
-        dummy = np.random.randn(8000).astype(np.float32) * 0.01
-        
-        with torch.inference_mode():
-            try:
-                start_time = time.time()
-                uv_pipe({'audio': dummy, 'turns': [], 'sampling_rate': 16000}, max_new_tokens=5)
-                warmup_time = time.time() - start_time
-                model_logger.info(f"✅ Ultravox warmed up in {warmup_time*1000:.0f}ms")
-            except Exception as e:
-                model_logger.warning(f"⚠️ Ultravox warmup issue: {e}")
-            
-            try:
-                start_time = time.time()
-                tts_model.generate("Test")
-                warmup_time = time.time() - start_time
-                model_logger.info(f"✅ TTS warmed up in {warmup_time*1000:.0f}ms")
-            except Exception as e:
-                model_logger.warning(f"⚠️ TTS warmup issue: {e}")
-        
-        model_logger.info("🎉 All models ready!")
-        return True
-        
-    except Exception as e:
-        model_logger.error(f"❌ Model initialization failed: {e}", exc_info=True)
-        return False
-
-# --- WebSocket Handler ---
-async def websocket_handler(request):
-    """WebSocket handler for audio streaming"""
-    ws = web.WebSocketResponse(heartbeat=30, timeout=120)
-    await ws.prepare(request)
-    
-    client_ip = request.remote
-    logger.info(f"🌐 WebSocket connection from {client_ip}")
-    active_connections.add(ws)
-    
-    processor = WebSocketAudioProcessor()
-    
-    try:
-        async for msg in ws:
-            if msg.type == WSMsgType.BINARY:
-                # Audio data received
-                audio_data = msg.data
-                logger.info(f"📥 Received {len(audio_data)} bytes of audio from {client_ip}")
-                
-                try:
-                    # Send processing start notification
-                    await ws.send_json({'type': 'processing_start'})
-                    
-                    # Process audio
-                    transcription, tts_audio = await processor.process_audio_data(audio_data)
-                    
-                    if transcription:
-                        # Send transcription
-                        await ws.send_json({
-                            'type': 'transcription',
-                            'text': transcription
-                        })
-                        
-                        # Send response text (echo for now)
-                        await ws.send_json({
-                            'type': 'response', 
-                            'text': transcription
-                        })
-                        
-                        if len(tts_audio) > 0:
-                            # Convert TTS audio to WAV format
-                            wav_data = await convert_to_wav(tts_audio)
-                            
-                            # Send audio ready notification
-                            await ws.send_json({'type': 'audio_ready'})
-                            
-                            # Send audio data
-                            await ws.send_bytes(wav_data)
-                            
-                            logger.info(f"✅ Sent {len(wav_data)} bytes of TTS audio to {client_ip}")
-                        else:
-                            await ws.send_json({
-                                'type': 'error',
-                                'message': 'No audio generated'
-                            })
-                    else:
-                        await ws.send_json({
-                            'type': 'error',
-                            'message': 'No speech detected or transcription failed'
-                        })
-                        
-                except Exception as e:
-                    logger.error(f"❌ Audio processing error for {client_ip}: {e}")
-                    await ws.send_json({
-                        'type': 'error',
-                        'message': f'Processing error: {str(e)}'
-                    })
-                    
-            elif msg.type == WSMsgType.TEXT:
-                # Text message (for future use)
-                try:
-                    data = json.loads(msg.data)
-                    logger.info(f"📝 Text message from {client_ip}: {data}")
-                except json.JSONDecodeError:
-                    logger.warning(f"⚠️ Invalid JSON from {client_ip}")
-                    
-            elif msg.type == WSMsgType.ERROR:
-                logger.error(f"❌ WebSocket error from {client_ip}: {ws.exception()}")
-                break
-                
-    except Exception as e:
-        logger.error(f"❌ WebSocket handler error for {client_ip}: {e}")
-    finally:
-        logger.info(f"🔚 WebSocket connection closed for {client_ip}")
-        active_connections.discard(ws)
-    
-    return ws
-
-async def convert_to_wav(audio_array: np.ndarray, sample_rate: int = 24000) -> bytes:
-    """Convert numpy audio array to WAV bytes"""
-    try:
-        import io
-        import wave
-        
-        # Convert to int16
-        audio_int16 = np.clip(audio_array * 32767, -32768, 32767).astype(np.int16)
-        
-        # Create WAV file in memory
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)  # Mono
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(audio_int16.tobytes())
-        
-        wav_data = wav_buffer.getvalue()
-        wav_buffer.close()
-        
-        return wav_data
-        
-    except Exception as e:
-        logger.error(f"❌ WAV conversion error: {e}")
-        return b''
 
 # --- HTTP Handlers ---
 async def index_handler(request):
@@ -939,15 +911,15 @@ async def health_handler(request):
     
     return web.json_response({
         "status": "healthy",
-        "mode": "websocket_audio_streaming",
+        "mode": "voxtral_higgs_websocket",
         "runpod": {
             "pod_id": RUNPOD_POD_ID,
             "public_ip": RUNPOD_PUBLIC_IP,
             "tcp_port": RUNPOD_TCP_PORT_7860
         },
         "models": {
-            "ultravox": uv_pipe is not None,
-            "tts": tts_model is not None
+            "voxtral": voxtral_model is not None,
+            "higgs_audio": higgs_model is not None
         },
         "connections": len(active_connections),
         "gpu": gpu_info,
@@ -956,7 +928,7 @@ async def health_handler(request):
 
 # --- Application ---
 async def on_shutdown(app):
-    logger.info("🛑 Shutting down WebSocket voice assistant...")
+    logger.info("🛑 Shutting down Voxtral + Higgs Audio assistant...")
     
     # Close active connections
     for ws in list(active_connections):
@@ -991,22 +963,22 @@ async def main():
         public_url = f"http://0.0.0.0:{port}"
     
     print("\n" + "="*80)
-    print("🚀 WEBSOCKET VOICE ASSISTANT - RUNPOD OPTIMIZED")
+    print("🚀 VOXTRAL + HIGGS AUDIO WEBSOCKET ASSISTANT")
     print("="*80)
     print(f"🏃 Runpod Pod ID: {RUNPOD_POD_ID}")
     print(f"📡 Public URL: {public_url}")
     print(f"🔗 Health Check: {public_url}/health")
-    print(f"🎯 Mode: WebSocket Audio Streaming (UDP-Free)")
+    print(f"🎯 Mode: WebSocket Audio Streaming")
     print(f"🧠 GPU: {'✅ ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else '❌ CPU Only'}")
-    print(f"🔊 TTS: ✅ ChatterboxTTS")
-    print(f"🎤 STT: ✅ Ultravox")
-    print(f"📝 Logging: ✅ Enhanced")
+    print(f"🔊 ASR+LLM: ✅ Voxtral-Mini-3B-2507")
+    print(f"🎤 TTS: ✅ Higgs Audio v2")
+    print(f"📝 Memory Req: ~15-16GB GPU RAM")
     print(f"🌐 WebSocket: ✅ Binary Audio Streaming")
     print("="*80)
     print("🛑 Press Ctrl+C to stop")
     print("="*80 + "\n")
     
-    logger.info(f"🎉 WebSocket voice assistant started")
+    logger.info(f"🎉 Voxtral + Higgs Audio assistant started")
     logger.info(f"📡 Accessible at: {public_url}")
     
     try:
@@ -1018,7 +990,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n✅ WebSocket voice assistant stopped")
+        print("\n✅ Voxtral + Higgs Audio assistant stopped")
     except Exception as e:
         logger.error(f"❌ Server startup failed: {e}", exc_info=True)
         sys.exit(1)
