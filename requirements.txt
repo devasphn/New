@@ -1,37 +1,12 @@
-# Core PyTorch dependencies (matching commands.txt)
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
-
-# Core ML and transformers
-transformers
+transformers 
 accelerate
-huggingface-hub
-peft
-
-# Audio processing
+mistral-common[audio]>=1.8.1
 librosa
+soundfile
 numpy
 scipy
-soundfile
-webrtcvad
-pyaudio
-
-# TTS model (as specified in commands.txt)
-chatterbox-tts
-
-# Web and networking
-aiohttp
-aiortc
 websockets
+aiohttp
 aiofiles
-
-# Audio processing and VAD
-torch-audiomentations
-silero-vad
-
-# Performance optimizations
+webrtcvad
 uvloop
-
-# Additional utilities
-gradio
