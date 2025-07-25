@@ -19,8 +19,9 @@ import io
 import wave
 
 from aiohttp import web, WSMsgType
-from transformers import VoxtralForConditionalGeneration, AutoProcessor
-from huggingface_hub import hf_hub_download
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+import torchaudio
+import torchaudio.functional as F
 
 # --- Runpod Environment Detection ---
 RUNPOD_POD_ID = os.environ.get('RUNPOD_POD_ID')
@@ -76,7 +77,8 @@ except ImportError:
 warnings.filterwarnings("ignore")
 
 # --- Global Variables ---
-voxtral_processor, voxtral_model, higgs_model = None, None, None
+voxtral_processor, voxtral_model, voxtral_tokenizer = None, None, None
+higgs_model, higgs_tokenizer = None, None
 executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="audio_worker")
 active_connections = set()
 
@@ -124,10 +126,47 @@ class ImprovedVAD:
             audio_logger.debug(f"WebRTC VAD error: {e}")
             return False
 
+# --- Simple TTS Implementation (Placeholder for Higgs Audio) ---
+class SimpleTTS:
+    """Simple TTS implementation as placeholder until Higgs Audio is properly integrated"""
+    
+    def __init__(self, sample_rate=24000):
+        self.sample_rate = sample_rate
+        
+    def synthesize(self, text: str) -> np.ndarray:
+        """Generate simple sine wave based TTS as placeholder"""
+        if not text.strip():
+            return np.array([])
+        
+        # Simple text-to-duration mapping
+        words = text.split()
+        duration = len(words) * 0.5 + 1.0  # 0.5s per word + 1s buffer
+        
+        # Generate a more pleasant multi-tone audio
+        samples = int(duration * self.sample_rate)
+        t = np.linspace(0, duration, samples)
+        
+        # Create a more pleasant sound with multiple harmonics
+        freq_base = 200  # Base frequency
+        audio = 0.3 * np.sin(2 * np.pi * freq_base * t)  # Fundamental
+        audio += 0.15 * np.sin(2 * np.pi * freq_base * 2 * t)  # Second harmonic
+        audio += 0.1 * np.sin(2 * np.pi * freq_base * 3 * t)   # Third harmonic
+        
+        # Add envelope to make it sound more natural
+        envelope = np.exp(-t * 0.5)  # Exponential decay
+        audio *= envelope
+        
+        # Add slight modulation for more natural sound
+        modulation = 1 + 0.1 * np.sin(2 * np.pi * 5 * t)
+        audio *= modulation
+        
+        return audio.astype(np.float32)
+
 # --- Audio Processing Pipeline ---
 class VoxtralHiggsProcessor:
     def __init__(self):
         self.vad = ImprovedVAD()
+        self.tts = SimpleTTS()
         
     async def process_audio_data(self, audio_data: bytes) -> Tuple[str, np.ndarray]:
         """Process audio data and return transcription and TTS audio"""
@@ -150,8 +189,8 @@ class VoxtralHiggsProcessor:
             if not transcription:
                 return "", np.array([])
             
-            # Run Higgs Audio TTS
-            tts_audio = await self._run_higgs_tts(transcription)
+            # Run TTS (using simple TTS for now)
+            tts_audio = await self._run_tts(transcription)
             
             return transcription, tts_audio
             
@@ -205,39 +244,39 @@ class VoxtralHiggsProcessor:
             
             def _inference():
                 with torch.inference_mode():
-                    # Prepare conversation format
-                    conversation = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "audio",
-                                    "audio": audio_array,
-                                    "sample_rate": 16000
-                                }
-                            ]
-                        }
-                    ]
+                    # Convert audio to tensor
+                    audio_tensor = torch.from_numpy(audio_array).unsqueeze(0)
                     
-                    # Process with Voxtral
-                    inputs = voxtral_processor.apply_chat_template(conversation)
-                    inputs = inputs.to(voxtral_model.device, dtype=torch.bfloat16)
-                    
-                    outputs = voxtral_model.generate(
-                        **inputs,
-                        max_new_tokens=150,
-                        temperature=0.2,
-                        do_sample=True,
-                        pad_token_id=voxtral_processor.tokenizer.eos_token_id
+                    # Create inputs for the model
+                    inputs = voxtral_processor(
+                        audio=audio_tensor,
+                        sampling_rate=16000,
+                        return_tensors="pt"
                     )
                     
+                    # Move to device
+                    inputs = inputs.to(voxtral_model.device)
+                    
+                    # Generate response
+                    with torch.no_grad():
+                        outputs = voxtral_model.generate(
+                            **inputs,
+                            max_new_tokens=150,
+                            temperature=0.7,
+                            do_sample=True,
+                            pad_token_id=voxtral_tokenizer.eos_token_id
+                        )
+                    
                     # Decode response
-                    decoded_outputs = voxtral_processor.batch_decode(
-                        outputs[:, inputs.input_ids.shape[1]:], 
+                    input_length = inputs.input_ids.shape[1] if hasattr(inputs, 'input_ids') else 0
+                    generated_tokens = outputs[:, input_length:]
+                    
+                    decoded_text = voxtral_tokenizer.decode(
+                        generated_tokens[0], 
                         skip_special_tokens=True
                     )
                     
-                    return decoded_outputs[0].strip() if decoded_outputs else ""
+                    return decoded_text.strip()
             
             start_time = time.time()
             text = await loop.run_in_executor(executor, _inference)
@@ -250,8 +289,8 @@ class VoxtralHiggsProcessor:
             model_logger.error(f"❌ Voxtral error: {e}")
             return ""
     
-    async def _run_higgs_tts(self, text: str) -> np.ndarray:
-        """Run Higgs Audio TTS"""
+    async def _run_tts(self, text: str) -> np.ndarray:
+        """Run TTS (Simple implementation for now)"""
         try:
             if not text.strip():
                 return np.array([])
@@ -259,38 +298,22 @@ class VoxtralHiggsProcessor:
             loop = asyncio.get_running_loop()
             
             def _tts_inference():
-                with torch.inference_mode():
-                    # Use Higgs Audio for TTS generation
-                    # This is a placeholder - you'll need to implement based on the actual Higgs Audio API
-                    # The model is at bosonai/higgs-audio-v2-generation-3B-base
-                    
-                    # For now, generate a simple sine wave as placeholder
-                    # Replace this with actual Higgs Audio TTS call
-                    duration = len(text.split()) * 0.5  # Rough estimate
-                    sample_rate = 24000
-                    samples = int(duration * sample_rate)
-                    
-                    # Generate placeholder audio (replace with actual TTS)
-                    t = np.linspace(0, duration, samples)
-                    freq = 440  # A4 note
-                    audio = 0.3 * np.sin(2 * np.pi * freq * t)
-                    
-                    return audio.astype(np.float32)
+                return self.tts.synthesize(text)
             
             start_time = time.time()
             audio_output = await loop.run_in_executor(executor, _tts_inference)
             tts_time = time.time() - start_time
             
-            model_logger.info(f"🔊 Higgs Audio completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
+            model_logger.info(f"🔊 TTS completed: {tts_time*1000:.0f}ms, {len(audio_output)/24000:.2f}s audio")
             return audio_output
             
         except Exception as e:
-            model_logger.error(f"❌ Higgs Audio TTS error: {e}")
+            model_logger.error(f"❌ TTS error: {e}")
             return np.array([])
 
 # --- Model Initialization ---
 def initialize_models() -> bool:
-    global voxtral_processor, voxtral_model, higgs_model
+    global voxtral_processor, voxtral_model, voxtral_tokenizer, higgs_model, higgs_tokenizer
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_logger.info(f"🚀 Initializing models on device: {device}")
@@ -301,53 +324,53 @@ def initialize_models() -> bool:
         model_logger.info(f"🎮 GPU: {gpu_name}, Memory: {gpu_memory:.1f}GB")
     
     try:
-        # Load Voxtral
+        # Load Voxtral Model
         model_logger.info("📥 Loading Voxtral model...")
         start_time = time.time()
         
         repo_id = "mistralai/Voxtral-Mini-3B-2507"
+        
+        # Load tokenizer and processor
+        voxtral_tokenizer = AutoTokenizer.from_pretrained(repo_id)
         voxtral_processor = AutoProcessor.from_pretrained(repo_id)
-        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-            repo_id, 
-            torch_dtype=torch.bfloat16, 
-            device_map="auto"
+        
+        # Load model with correct class
+        voxtral_model = AutoModelForCausalLM.from_pretrained(
+            repo_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
         )
         
         load_time = time.time() - start_time
         model_logger.info(f"✅ Voxtral loaded in {load_time:.1f}s")
         
-        # Load Higgs Audio (placeholder - implement actual loading)
-        model_logger.info("📥 Loading Higgs Audio model...")
-        start_time = time.time()
+        # Initialize simple TTS (placeholder for Higgs Audio)
+        model_logger.info("📥 Initializing TTS system...")
+        higgs_model = "simple_tts_placeholder"  # We'll use SimpleTTS class
+        model_logger.info("✅ TTS system ready")
         
-        # TODO: Implement actual Higgs Audio model loading
-        # higgs_model = HiggsAudioModel.from_pretrained("bosonai/higgs-audio-v2-generation-3B-base")
-        higgs_model = "placeholder"  # Replace with actual model
-        
-        load_time = time.time() - start_time
-        model_logger.info(f"✅ Higgs Audio loaded in {load_time:.1f}s")
-        
-        # Warmup
-        model_logger.info("🔥 Warming up models...")
-        dummy_audio = np.random.randn(8000).astype(np.float32) * 0.01
-        
-        with torch.inference_mode():
-            try:
-                conversation = [{
-                    "role": "user",
-                    "content": [{"type": "audio", "audio": dummy_audio, "sample_rate": 16000}]
-                }]
-                
-                inputs = voxtral_processor.apply_chat_template(conversation)
-                inputs = inputs.to(voxtral_model.device, dtype=torch.bfloat16)
-                
-                start_time = time.time()
+        # Warmup Voxtral
+        model_logger.info("🔥 Warming up Voxtral...")
+        try:
+            dummy_audio = np.random.randn(8000).astype(np.float32) * 0.01
+            audio_tensor = torch.from_numpy(dummy_audio).unsqueeze(0)
+            
+            inputs = voxtral_processor(
+                audio=audio_tensor,
+                sampling_rate=16000,
+                return_tensors="pt"
+            )
+            inputs = inputs.to(voxtral_model.device)
+            
+            start_time = time.time()
+            with torch.no_grad():
                 outputs = voxtral_model.generate(**inputs, max_new_tokens=5)
-                warmup_time = time.time() - start_time
-                model_logger.info(f"✅ Voxtral warmed up in {warmup_time*1000:.0f}ms")
-                
-            except Exception as e:
-                model_logger.warning(f"⚠️ Voxtral warmup issue: {e}")
+            warmup_time = time.time() - start_time
+            model_logger.info(f"✅ Voxtral warmed up in {warmup_time*1000:.0f}ms")
+            
+        except Exception as e:
+            model_logger.warning(f"⚠️ Voxtral warmup issue: {e}")
         
         model_logger.info("🎉 All models ready!")
         return True
@@ -467,7 +490,7 @@ async def convert_to_wav(audio_array: np.ndarray, sample_rate: int = 24000) -> b
         logger.error(f"❌ WAV conversion error: {e}")
         return b''
 
-# --- WebSocket HTML Client (same as before) ---
+# --- HTML Client (keeping the same as before) ---
 def get_websocket_html_client():
     """Generate HTML client for WebSocket audio streaming"""
     
@@ -572,14 +595,14 @@ def get_websocket_html_client():
 </head>
 <body>
     <div class="container">
-        <h1>🚀 Voxtral + Higgs Audio Assistant</h1>
+        <h1>🚀 Voxtral + Simple TTS Assistant</h1>
         
         <div class="model-info">
-            <strong>🤖 New Generation Models</strong><br>
+            <strong>🤖 Audio AI Models</strong><br>
             ASR+LLM: Voxtral-Mini-3B-2507 (Mistral AI)<br>
-            TTS: Higgs Audio v2 (Boson AI)<br>
+            TTS: Simple TTS (Placeholder)<br>
             WebSocket: {ws_url}<br>
-            <small>✅ Cutting-edge Audio AI</small>
+            <small>✅ Ready for Testing</small>
         </div>
         
         <div class="controls">
@@ -609,7 +632,7 @@ def get_websocket_html_client():
         </div>
         
         <div id="conversation" class="conversation"></div>
-        <div id="debug" class="debug">Voxtral + Higgs Audio WebSocket Assistant ready...</div>
+        <div id="debug" class="debug">Voxtral + Simple TTS WebSocket Assistant ready...</div>
         
         <audio id="responseAudio" controls style="width: 100%; margin: 10px 0; display: none;"></audio>
     </div>
@@ -756,7 +779,7 @@ def get_websocket_html_client():
                     
                     if (startTime) {{
                         const totalLatency = Date.now() - startTime;
-                        updateMetrics(totalLatency, 'Connected', 'Excellent');
+                        updateMetrics(totalLatency, 'Connected', 'Good');
                         log(`⚡ Total latency: ${{totalLatency}}ms`);
                     }}
                 }};
@@ -865,7 +888,7 @@ def get_websocket_html_client():
 
         // Initialize on page load
         window.addEventListener('load', () => {{
-            log('🚀 Voxtral + Higgs Audio WebSocket Assistant initialized');
+            log('🚀 Voxtral + Simple TTS WebSocket Assistant initialized');
             initializeWebSocket();
         }});
 
@@ -911,7 +934,7 @@ async def health_handler(request):
     
     return web.json_response({
         "status": "healthy",
-        "mode": "voxtral_higgs_websocket",
+        "mode": "voxtral_simple_tts_websocket",
         "runpod": {
             "pod_id": RUNPOD_POD_ID,
             "public_ip": RUNPOD_PUBLIC_IP,
@@ -919,7 +942,7 @@ async def health_handler(request):
         },
         "models": {
             "voxtral": voxtral_model is not None,
-            "higgs_audio": higgs_model is not None
+            "tts": "simple_tts_ready"
         },
         "connections": len(active_connections),
         "gpu": gpu_info,
@@ -928,7 +951,7 @@ async def health_handler(request):
 
 # --- Application ---
 async def on_shutdown(app):
-    logger.info("🛑 Shutting down Voxtral + Higgs Audio assistant...")
+    logger.info("🛑 Shutting down Voxtral + Simple TTS assistant...")
     
     # Close active connections
     for ws in list(active_connections):
@@ -963,7 +986,7 @@ async def main():
         public_url = f"http://0.0.0.0:{port}"
     
     print("\n" + "="*80)
-    print("🚀 VOXTRAL + HIGGS AUDIO WEBSOCKET ASSISTANT")
+    print("🚀 VOXTRAL + SIMPLE TTS WEBSOCKET ASSISTANT")
     print("="*80)
     print(f"🏃 Runpod Pod ID: {RUNPOD_POD_ID}")
     print(f"📡 Public URL: {public_url}")
@@ -971,14 +994,14 @@ async def main():
     print(f"🎯 Mode: WebSocket Audio Streaming")
     print(f"🧠 GPU: {'✅ ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else '❌ CPU Only'}")
     print(f"🔊 ASR+LLM: ✅ Voxtral-Mini-3B-2507")
-    print(f"🎤 TTS: ✅ Higgs Audio v2")
-    print(f"📝 Memory Req: ~15-16GB GPU RAM")
+    print(f"🎤 TTS: ✅ Simple TTS (Placeholder)")
+    print(f"📝 Status: Ready for Testing")
     print(f"🌐 WebSocket: ✅ Binary Audio Streaming")
     print("="*80)
     print("🛑 Press Ctrl+C to stop")
     print("="*80 + "\n")
     
-    logger.info(f"🎉 Voxtral + Higgs Audio assistant started")
+    logger.info(f"🎉 Voxtral + Simple TTS assistant started")
     logger.info(f"📡 Accessible at: {public_url}")
     
     try:
@@ -990,7 +1013,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n✅ Voxtral + Higgs Audio assistant stopped")
+        print("\n✅ Voxtral + Simple TTS assistant stopped")
     except Exception as e:
         logger.error(f"❌ Server startup failed: {e}", exc_info=True)
         sys.exit(1)
