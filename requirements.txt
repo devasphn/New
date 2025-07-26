@@ -1,14 +1,31 @@
-transformers>=4.45.0
+# Core PyTorch dependencies
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+
+# Core ML and transformers
+transformers
 accelerate
-mistral-common[audio]>=1.8.1
+huggingface-hub
+peft
+
+# Audio processing
 librosa
-soundfile
 numpy
 scipy
-websockets
-aiohttp
-aiofiles
+soundfile
 webrtcvad
+
+# TTS model
+chatterbox-tts
+
+# Web and networking (WebSocket implementation)
+aiohttp
+websockets
+aiofiles
+
+# Audio processing and VAD
+torch-audiomentations
+
+# Performance optimizations
 uvloop
-einops
-datasets
