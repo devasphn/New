@@ -58,7 +58,7 @@ pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https
 
 # Install Python dependencies from requirements file
 echo "🐍 Installing Python dependencies from requirements_runpod.txt..."
-pip install -r requirements_runpod.txt
+pip install -r requirements.txt
 
 # Pre-download models to avoid cold start delays
 echo "📥 Pre-downloading models..."
@@ -103,7 +103,7 @@ except Exception as e:
 "
 
 # Set proper permissions
-chmod +x ultraandchat_runpod_websocket.py
+chmod +x websockets.py
 
 echo "✅ Runpod deployment setup complete"
 
