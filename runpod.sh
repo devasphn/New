@@ -115,7 +115,7 @@ start_websocket() {
     pm2 delete ultraandchat-websocket 2>/dev/null || true
 
     # Start with PM2 using virtual environment
-    pm2 start venv/bin/python --name "ultraandchat-websocket" -- ultraandchat_runpod_websocket.py
+    pm2 start venv/bin/python --name "websockets" -- websockets.py
 
     echo "✅ WebSocket Voice Assistant started with PM2"
     echo "📡 Access at: https://$RUNPOD_POD_ID-7860.proxy.runpod.net"
