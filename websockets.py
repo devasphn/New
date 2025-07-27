@@ -34,7 +34,7 @@ if not RUNPOD_POD_ID:
 RUNPOD_PUBLIC_IP = os.environ.get('RUNPOD_PUBLIC_IP', '0.0.0.0')
 RUNPOD_TCP_PORT_7860 = os.environ.get('RUNPOD_TCP_PORT_7860', '7860')
 
-print(f"🚀 RUNPOD WEBSOCKET VOICE ASSISTANT")
+print(f"🚀 RUNPOD CONTINUOUS VOICE ASSISTANT")
 print(f"📍 Pod ID: {RUNPOD_POD_ID}")
 print(f"🌐 Public IP: {RUNPOD_PUBLIC_IP}")
 print(f"🔌 TCP Port: {RUNPOD_TCP_PORT_7860}")
@@ -48,7 +48,7 @@ def setup_runpod_logging():
         format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(f'/tmp/logs/websocket_voice_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+            logging.FileHandler(f'/tmp/logs/continuous_voice_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         ]
     )
     
@@ -59,7 +59,7 @@ def setup_runpod_logging():
     for logger_name in ['urllib3', 'requests']:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
     
-    logger.info("🔧 WebSocket voice assistant logging initialized")
+    logger.info("🔧 Continuous voice assistant logging initialized")
     return logger, audio_logger, model_logger
 
 logger, audio_logger, model_logger = setup_runpod_logging()
@@ -79,9 +79,9 @@ uv_pipe, tts_model = None, None
 executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="audio_worker")
 active_connections = set()
 
-# --- WebSocket Audio Streaming HTML Client ---
-def get_websocket_html_client():
-    """Generate HTML client for WebSocket audio streaming"""
+# --- Continuous Conversation HTML Client ---
+def get_continuous_html_client():
+    """Generate HTML client for continuous conversation"""
     
     if RUNPOD_POD_ID != 'local':
         public_url = f"https://{RUNPOD_POD_ID}-7860.proxy.runpod.net"
@@ -96,7 +96,7 @@ def get_websocket_html_client():
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>🚀 WebSocket Voice Assistant - Runpod</title>
+    <title>🚀 Continuous Voice Assistant - Runpod</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -130,7 +130,7 @@ def get_websocket_html_client():
             transform: none; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
         }}
         .stop-btn {{ background: linear-gradient(45deg, #dc3545, #c82333); }}
-        .recording {{ background: linear-gradient(45deg, #ff6b35, #f7931e); animation: pulse 1s infinite; }}
+        .active {{ background: linear-gradient(45deg, #ff6b35, #f7931e); animation: pulse 1s infinite; }}
         
         .status {{ 
             margin: 25px 0; padding: 20px; border-radius: 15px; font-weight: 600; font-size: 1.1em;
@@ -138,7 +138,7 @@ def get_websocket_html_client():
         }}
         .status.connected {{ background: linear-gradient(45deg, #28a745, #20c997); }}
         .status.disconnected {{ background: linear-gradient(45deg, #dc3545, #fd7e14); }}
-        .status.recording {{ background: linear-gradient(45deg, #ff6b35, #f7931e); animation: pulse 2s infinite; }}
+        .status.listening {{ background: linear-gradient(45deg, #17a2b8, #20c997); animation: pulse 2s infinite; }}
         .status.processing {{ background: linear-gradient(45deg, #ffc107, #fd7e14); }}
         .status.speaking {{ background: linear-gradient(45deg, #007bff, #6610f2); }}
         
@@ -180,17 +180,26 @@ def get_websocket_html_client():
             height: 100%; background: linear-gradient(90deg, #00ff00, #ffff00, #ff0000);
             width: 0%; transition: width 0.1s ease;
         }}
+        
+        .conversation-hint {{
+            background: rgba(255,255,0,0.1); padding: 10px; border-radius: 8px; margin: 10px 0;
+            border: 1px solid rgba(255,255,0,0.3); font-size: 0.9em;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 WebSocket Voice AI - Runpod</h1>
+        <h1>🚀 Continuous Voice AI - Runpod</h1>
         
         <div class="runpod-info">
-            <strong>🏃 Runpod WebSocket Mode</strong><br>
+            <strong>🏃 Runpod Continuous Mode</strong><br>
             Pod ID: {RUNPOD_POD_ID}<br>
             WebSocket: {ws_url}<br>
-            <small>✅ UDP-Free Audio Streaming</small>
+            <small>✅ 2-Way Conversation Flow</small>
+        </div>
+        
+        <div class="conversation-hint">
+            💡 <strong>How it works:</strong> Start conversation → Speak naturally → AI responds automatically → Continue talking → End when done
         </div>
         
         <div class="controls">
@@ -220,9 +229,9 @@ def get_websocket_html_client():
         </div>
         
         <div id="conversation" class="conversation"></div>
-        <div id="debug" class="debug">WebSocket Voice Assistant ready...</div>
+        <div id="debug" class="debug">Continuous Voice Assistant ready...</div>
         
-        <audio id="responseAudio" controls style="width: 100%; margin: 10px 0; display: none;"></audio>
+        <audio id="responseAudio" autoplay style="display: none;"></audio>
     </div>
 
     <script>
@@ -234,8 +243,9 @@ def get_websocket_html_client():
         let startTime;
         let audioChunks = [];
         let silenceTimer = null;
-        let vadThreshold = 30; // Volume threshold for voice activity detection
-        let silenceTimeout = 2000; // 2 seconds of silence before auto-stop
+        let vadThreshold = 25; // Volume threshold for voice activity detection
+        let silenceTimeout = 2500; // 2.5 seconds of silence before auto-stop
+        let recordingChunkSize = 1000; // 1 second chunks
         
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
@@ -323,6 +333,7 @@ def get_websocket_html_client():
                     updateMetrics(undefined, 'Disconnected', '-');
                     startBtn.disabled = true;
                     stopBtn.disabled = true;
+                    isConversationActive = false;
                 }};
 
                 ws.onerror = (error) => {{
@@ -346,35 +357,67 @@ def get_websocket_html_client():
                     log(`🤖 AI Response: ${{data.text}}`);
                     break;
                 case 'processing_start':
+                    isProcessing = true;
                     updateStatus('🧠 Processing...', 'processing');
                     break;
                 case 'audio_ready':
-                    updateStatus('🔊 Playing Response...', 'speaking');
+                    isAISpeaking = true;
+                    updateStatus('🔊 AI Speaking...', 'speaking');
+                    break;
+                case 'audio_ended':
+                    isAISpeaking = false;
+                    isProcessing = false;
+                    if (isConversationActive) {{
+                        // Resume listening after AI finishes speaking
+                        setTimeout(() => {{
+                            if (isConversationActive && !isProcessing) {{
+                                startListening();
+                            }}
+                        }}, 500);
+                    }}
                     break;
                 case 'error':
                     log(`❌ Server error: ${{data.message}}`);
-                    updateStatus('❌ Error', 'disconnected');
+                    isProcessing = false;
+                    isAISpeaking = false;
+                    if (isConversationActive) {{
+                        startListening();
+                    }}
                     break;
             }}
         }}
 
         async function handleAudioResponse(audioData) {{
             try {{
+                isAISpeaking = true;
                 const audioBlob = new Blob([audioData], {{ type: 'audio/wav' }});
                 const audioUrl = URL.createObjectURL(audioBlob);
                 
                 responseAudio.src = audioUrl;
-                responseAudio.style.display = 'block';
                 
                 responseAudio.onended = () => {{
-                    updateStatus('🎙️ Ready to Record', 'connected');
                     URL.revokeObjectURL(audioUrl);
-                    responseAudio.style.display = 'none';
+                    isAISpeaking = false;
+                    isProcessing = false;
                     
                     if (startTime) {{
                         const totalLatency = Date.now() - startTime;
                         updateMetrics(totalLatency, 'Connected', 'Excellent');
                         log(`⚡ Total latency: ${{totalLatency}}ms`);
+                    }}
+                    
+                    // Send audio ended signal to server
+                    if (ws && ws.readyState === WebSocket.OPEN) {{
+                        ws.send(JSON.stringify({{ type: 'audio_ended' }}));
+                    }}
+                    
+                    // Resume listening if conversation is still active
+                    if (isConversationActive) {{
+                        setTimeout(() => {{
+                            if (isConversationActive && !isProcessing && !isAISpeaking) {{
+                                startListening();
+                            }}
+                        }}, 500);
                     }}
                 }};
                 
@@ -382,14 +425,27 @@ def get_websocket_html_client():
                 
             }} catch (err) {{
                 log(`❌ Audio playback error: ${{err.message}}`);
+                isAISpeaking = false;
+                isProcessing = false;
+                if (isConversationActive) {{
+                    startListening();
+                }}
             }}
         }}
 
-        async function startRecording() {{
+        async function startConversation() {{
             try {{
-                log('🎤 Starting recording...');
+                log('🎙️ Starting continuous conversation...');
+                isConversationActive = true;
                 
-                const stream = await navigator.mediaDevices.getUserMedia({{
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                startBtn.classList.add('active');
+                
+                updateStatus('🎤 Initializing microphone...', 'connecting');
+                
+                // Get microphone access
+                stream = await navigator.mediaDevices.getUserMedia({{
                     audio: {{
                         echoCancellation: true,
                         noiseSuppression: true,
@@ -405,21 +461,30 @@ def get_websocket_html_client():
                 microphone.connect(analyser);
                 
                 analyser.fftSize = 256;
-                const bufferLength = analyser.frequencyBinCount;
-                const dataArray = new Uint8Array(bufferLength);
                 
-                // Volume monitoring
-                function updateVolume() {{
-                    if (isRecording) {{
-                        analyser.getByteFrequencyData(dataArray);
-                        const average = dataArray.reduce((a, b) => a + b) / bufferLength;
-                        updateVolumeBar(average / 255);
-                        requestAnimationFrame(updateVolume);
-                    }}
-                }}
-                updateVolume();
+                log('✅ Continuous conversation started');
+                updateMetrics(undefined, 'Connected', 'Excellent');
+                
+                // Start listening
+                startListening();
+                
+            }} catch (err) {{
+                log(`❌ Conversation start error: ${{err.message}}`);
+                updateStatus('❌ Microphone Error', 'disconnected');
+                stopConversation();
+            }}
+        }}
 
-                // Setup MediaRecorder
+        async function startListening() {{
+            if (!isConversationActive || isRecording || isProcessing || isAISpeaking) {{
+                return;
+            }}
+            
+            try {{
+                log('👂 Starting to listen...');
+                updateStatus('👂 Listening for speech...', 'listening');
+                
+                // Setup MediaRecorder for this listening session
                 mediaRecorder = new MediaRecorder(stream, {{
                     mimeType: 'audio/webm;codecs=opus'
                 }});
@@ -433,74 +498,158 @@ def get_websocket_html_client():
                 }};
                 
                 mediaRecorder.onstop = async () => {{
-                    log('🎤 Recording stopped, processing...');
+                    if (!isConversationActive) return;
+                    
+                    log('🎤 Processing recorded audio...');
                     
                     const audioBlob = new Blob(audioChunks, {{ type: 'audio/webm' }});
                     const arrayBuffer = await audioBlob.arrayBuffer();
                     
-                    if (ws && ws.readyState === WebSocket.OPEN) {{
+                    if (ws && ws.readyState === WebSocket.OPEN && arrayBuffer.byteLength > 1000) {{
                         startTime = Date.now();
-                        updateStatus('📤 Sending Audio...', 'processing');
+                        isProcessing = true;
+                        updateStatus('📤 Sending audio...', 'processing');
                         ws.send(arrayBuffer);
-                    }}
-                    
-                    stream.getTracks().forEach(track => track.stop());
-                    if (audioContext) {{
-                        audioContext.close();
+                    }} else if (isConversationActive) {{
+                        // No significant audio, resume listening
+                        setTimeout(() => startListening(), 500);
                     }}
                 }};
                 
+                // Start recording
                 mediaRecorder.start();
                 isRecording = true;
                 
-                updateStatus('🎙️ Recording...', 'recording');
-                startBtn.disabled = true;
-                stopBtn.disabled = false;
-                startBtn.classList.add('recording');
-                
-                log('✅ Recording started');
+                // Monitor volume and detect speech
+                monitorSpeech();
                 
             }} catch (err) {{
-                log(`❌ Recording error: ${{err.message}}`);
-                updateStatus('❌ Microphone Error', 'disconnected');
+                log(`❌ Listening error: ${{err.message}}`);
+                if (isConversationActive) {{
+                    setTimeout(() => startListening(), 1000);
+                }}
             }}
         }}
 
-        function stopRecording() {{
+        function monitorSpeech() {{
+            if (!isRecording || !isConversationActive) return;
+            
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            
+            function checkVolume() {{
+                if (!isRecording || !isConversationActive) return;
+                
+                analyser.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b) / bufferLength;
+                const volume = average / 255 * 100;
+                
+                updateVolumeBar(volume / 100);
+                
+                // Voice activity detection
+                if (volume > vadThreshold) {{
+                    // Speech detected, clear silence timer
+                    if (silenceTimer) {{
+                        clearTimeout(silenceTimer);
+                        silenceTimer = null;
+                    }}
+                }} else {{
+                    // Silence detected, start timer if not already started
+                    if (!silenceTimer) {{
+                        silenceTimer = setTimeout(() => {{
+                            if (isRecording && isConversationActive) {{
+                                log('🔇 Silence detected, stopping recording');
+                                stopCurrentRecording();
+                            }}
+                        }}, silenceTimeout);
+                    }}
+                }}
+                
+                requestAnimationFrame(checkVolume);
+            }}
+            
+            checkVolume();
+        }}
+
+        function stopCurrentRecording() {{
             if (mediaRecorder && isRecording) {{
                 mediaRecorder.stop();
                 isRecording = false;
                 
-                startBtn.disabled = false;
-                stopBtn.disabled = true;
-                startBtn.classList.remove('recording');
+                if (silenceTimer) {{
+                    clearTimeout(silenceTimer);
+                    silenceTimer = null;
+                }}
                 
                 updateVolumeBar(0);
-                log('⏹️ Recording stopped');
             }}
+        }}
+
+        function stopConversation() {{
+            log('🛑 Stopping conversation...');
+            isConversationActive = false;
+            isRecording = false;
+            isProcessing = false;
+            isAISpeaking = false;
+            
+            // Stop current recording
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {{
+                mediaRecorder.stop();
+            }}
+            
+            // Clear timers
+            if (silenceTimer) {{
+                clearTimeout(silenceTimer);
+                silenceTimer = null;
+            }}
+            
+            // Stop media stream
+            if (stream) {{
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }}
+            
+            // Close audio context
+            if (audioContext) {{
+                audioContext.close();
+                audioContext = null;
+            }}
+            
+            // Stop audio playback
+            if (responseAudio) {{
+                responseAudio.pause();
+                responseAudio.src = '';
+            }}
+            
+            // Reset UI
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            startBtn.classList.remove('active');
+            
+            updateStatus('🔌 Connected', 'connected');
+            updateVolumeBar(0);
+            
+            log('✅ Conversation ended');
         }}
 
         // Initialize on page load
         window.addEventListener('load', () => {{
-            log('🚀 WebSocket Voice Assistant initialized');
+            log('🚀 Continuous Voice Assistant initialized');
             initializeWebSocket();
         }});
 
         // Cleanup on page unload
         window.addEventListener('beforeunload', () => {{
+            stopConversation();
             if (ws) {{
                 ws.close();
-            }}
-            if (mediaRecorder && isRecording) {{
-                mediaRecorder.stop();
             }}
         }});
     </script>
 </body>
 </html>
-"""
-
-# --- Enhanced VAD System ---
+"""#
+ --- Enhanced VAD System ---
 class ImprovedVAD:
     def __init__(self):
         self.webrtc_vad = webrtcvad.Vad(2)
@@ -561,7 +710,7 @@ class ImprovedVAD:
             
             if total_frames > 0:
                 speech_ratio = speech_frames / total_frames
-                return speech_ratio > 0.3
+                return speech_ratio > 0.25  # Lower threshold for continuous mode
                 
             return False
         except Exception as e:
@@ -575,16 +724,16 @@ class ImprovedVAD:
                 audio_tensor,
                 self.silero_model,
                 sampling_rate=16000,
-                min_speech_duration_ms=200,
-                threshold=0.3
+                min_speech_duration_ms=150,  # Shorter for continuous mode
+                threshold=0.25  # Lower threshold
             )
             return len(speech_timestamps) > 0
         except Exception as e:
             audio_logger.debug(f"Silero VAD error: {e}")
             return True
 
-# --- Audio Processing Pipeline ---
-class WebSocketAudioProcessor:
+# --- Continuous Audio Processing Pipeline ---
+class ContinuousAudioProcessor:
     def __init__(self):
         self.vad = ImprovedVAD()
         
@@ -597,7 +746,7 @@ class WebSocketAudioProcessor:
             if audio_array is None or len(audio_array) == 0:
                 return "", np.array([])
             
-            # Check for speech
+            # Check for speech with more lenient threshold
             if not self.vad.detect_speech(audio_array):
                 audio_logger.info("⚠️ No speech detected in audio")
                 return "", np.array([])
@@ -609,8 +758,11 @@ class WebSocketAudioProcessor:
             if not transcription:
                 return "", np.array([])
             
+            # Generate AI response (simple echo for now, can be enhanced)
+            ai_response = await self._generate_ai_response(transcription)
+            
             # Run TTS
-            tts_audio = await self._run_tts(transcription)
+            tts_audio = await self._run_tts(ai_response)
             
             return transcription, tts_audio
             
@@ -695,6 +847,28 @@ class WebSocketAudioProcessor:
         except Exception as e:
             model_logger.error(f"❌ STT error: {e}")
             return ""
+    
+    async def _generate_ai_response(self, user_text: str) -> str:
+        """Generate AI response (can be enhanced with actual AI model)"""
+        try:
+            # Simple response generation - can be replaced with actual AI model
+            responses = [
+                f"I heard you say: {user_text}",
+                f"That's interesting! You mentioned: {user_text}",
+                f"Thanks for sharing: {user_text}",
+                f"I understand you said: {user_text}",
+                f"Got it! You told me: {user_text}"
+            ]
+            
+            import random
+            response = random.choice(responses)
+            
+            model_logger.info(f"🤖 AI Response: '{response}'")
+            return response
+            
+        except Exception as e:
+            model_logger.error(f"❌ AI response generation error: {e}")
+            return f"I heard: {user_text}"
     
     async def _run_tts(self, text: str) -> np.ndarray:
         """Run text-to-speech"""
@@ -797,17 +971,17 @@ def initialize_models() -> bool:
         model_logger.error(f"❌ Model initialization failed: {e}", exc_info=True)
         return False
 
-# --- WebSocket Handler ---
+# --- Continuous WebSocket Handler ---
 async def websocket_handler(request):
-    """WebSocket handler for audio streaming"""
-    ws = web.WebSocketResponse(heartbeat=30, timeout=120)
+    """WebSocket handler for continuous conversation"""
+    ws = web.WebSocketResponse(heartbeat=30, timeout=300)  # Longer timeout for conversations
     await ws.prepare(request)
     
     client_ip = request.remote
-    logger.info(f"🌐 WebSocket connection from {client_ip}")
+    logger.info(f"🌐 Continuous WebSocket connection from {client_ip}")
     active_connections.add(ws)
     
-    processor = WebSocketAudioProcessor()
+    processor = ContinuousAudioProcessor()
     
     try:
         async for msg in ws:
@@ -830,10 +1004,10 @@ async def websocket_handler(request):
                             'text': transcription
                         })
                         
-                        # Send response text (echo for now)
+                        # Send AI response text
                         await ws.send_json({
                             'type': 'response', 
-                            'text': transcription
+                            'text': transcription  # For now, echo back
                         })
                         
                         if len(tts_audio) > 0:
@@ -866,10 +1040,15 @@ async def websocket_handler(request):
                     })
                     
             elif msg.type == WSMsgType.TEXT:
-                # Text message (for future use)
+                # Text message handling
                 try:
                     data = json.loads(msg.data)
-                    logger.info(f"📝 Text message from {client_ip}: {data}")
+                    if data.get('type') == 'audio_ended':
+                        # Client finished playing audio
+                        await ws.send_json({'type': 'audio_ended'})
+                        logger.debug(f"📢 Audio playback ended for {client_ip}")
+                    else:
+                        logger.info(f"📝 Text message from {client_ip}: {data}")
                 except json.JSONDecodeError:
                     logger.warning(f"⚠️ Invalid JSON from {client_ip}")
                     
@@ -880,7 +1059,7 @@ async def websocket_handler(request):
     except Exception as e:
         logger.error(f"❌ WebSocket handler error for {client_ip}: {e}")
     finally:
-        logger.info(f"🔚 WebSocket connection closed for {client_ip}")
+        logger.info(f"🔚 Continuous WebSocket connection closed for {client_ip}")
         active_connections.discard(ws)
     
     return ws
@@ -913,7 +1092,7 @@ async def convert_to_wav(audio_array: np.ndarray, sample_rate: int = 24000) -> b
 
 # --- HTTP Handlers ---
 async def index_handler(request):
-    html_content = get_websocket_html_client()
+    html_content = get_continuous_html_client()
     return web.Response(
         text=html_content,
         content_type='text/html',
@@ -939,7 +1118,7 @@ async def health_handler(request):
     
     return web.json_response({
         "status": "healthy",
-        "mode": "websocket_audio_streaming",
+        "mode": "continuous_conversation",
         "runpod": {
             "pod_id": RUNPOD_POD_ID,
             "public_ip": RUNPOD_PUBLIC_IP,
@@ -956,7 +1135,7 @@ async def health_handler(request):
 
 # --- Application ---
 async def on_shutdown(app):
-    logger.info("🛑 Shutting down WebSocket voice assistant...")
+    logger.info("🛑 Shutting down continuous voice assistant...")
     
     # Close active connections
     for ws in list(active_connections):
@@ -991,22 +1170,23 @@ async def main():
         public_url = f"http://0.0.0.0:{port}"
     
     print("\n" + "="*80)
-    print("🚀 WEBSOCKET VOICE ASSISTANT - RUNPOD OPTIMIZED")
+    print("🚀 CONTINUOUS VOICE ASSISTANT - RUNPOD OPTIMIZED")
     print("="*80)
     print(f"🏃 Runpod Pod ID: {RUNPOD_POD_ID}")
     print(f"📡 Public URL: {public_url}")
     print(f"🔗 Health Check: {public_url}/health")
-    print(f"🎯 Mode: WebSocket Audio Streaming (UDP-Free)")
+    print(f"🎯 Mode: Continuous 2-Way Conversation")
     print(f"🧠 GPU: {'✅ ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else '❌ CPU Only'}")
     print(f"🔊 TTS: ✅ ChatterboxTTS")
     print(f"🎤 STT: ✅ Ultravox")
     print(f"📝 Logging: ✅ Enhanced")
-    print(f"🌐 WebSocket: ✅ Binary Audio Streaming")
+    print(f"🌐 WebSocket: ✅ Continuous Audio Streaming")
+    print(f"💬 Conversation: ✅ Auto-Resume After AI Response")
     print("="*80)
     print("🛑 Press Ctrl+C to stop")
     print("="*80 + "\n")
     
-    logger.info(f"🎉 WebSocket voice assistant started")
+    logger.info(f"🎉 Continuous voice assistant started")
     logger.info(f"📡 Accessible at: {public_url}")
     
     try:
@@ -1018,7 +1198,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n✅ WebSocket voice assistant stopped")
+        print("\n✅ Continuous voice assistant stopped")
     except Exception as e:
         logger.error(f"❌ Server startup failed: {e}", exc_info=True)
         sys.exit(1)
